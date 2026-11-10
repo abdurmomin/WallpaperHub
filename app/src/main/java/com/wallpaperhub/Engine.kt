@@ -62,7 +62,21 @@ object Engine {
     val SOURCES = listOf("bing", "wikimedia", "nasa", "reddit", "unsplash", "pixabay")
     private val REDDIT = mapOf("Nature" to "EarthPorn", "Space" to "spaceporn", "City" to "CityPorn", "Architecture" to "ArchitecturePorn")
     private val pool = ArrayList<Pair<String, String>>()
-    private val used = HashSet<String>()
+    // picture file name -> last time it was shown (persisted); a normal picture is not shown again for 120 days
+    private val seen = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private var seenReady = false
+    private fun nameOf(u: String) = md5(u) + ".jpg"
+    private fun seenInit(c: Context) {
+        if (seenReady) return; seenReady = true
+        val sp = c.getSharedPreferences("seen", 0); val ed = sp.edit(); val cut = System.currentTimeMillis() - 120 * 86_400_000L
+        for ((k, v) in sp.all) { if (v is Long && v > cut) seen[k] = v else ed.remove(k) }
+        ed.apply()
+        for (f in allFiles(c)) seen.putIfAbsent(f.name, f.lastModified())
+    }
+    private fun mark(c: Context, name: String) {
+        val t = System.currentTimeMillis(); seen[name] = t
+        c.getSharedPreferences("seen", 0).edit().putLong(name, t).apply()
+    }
     private val mutex = Mutex()
 
     fun reset() = pool.clear()
@@ -76,6 +90,7 @@ object Engine {
     private fun meta(c: Context) = c.getSharedPreferences("meta", 0)
     fun titleOf(c: Context, name: String) = meta(c).getString(name, "Saved picture").orEmpty()
     fun find(c: Context, name: String): File? = listOf(File(lib(c), name), File(fav(c), name)).firstOrNull { name.isNotBlank() && it.exists() }
+    private fun allFiles(c: Context): List<File> = (lib(c).listFiles()?.toList() ?: emptyList<File>()) + (fav(c).listFiles()?.toList() ?: emptyList<File>())
     fun libCount(c: Context) = lib(c).listFiles().orEmpty().size
 
     // ---------- network ----------
@@ -94,12 +109,12 @@ object Engine {
 
     // ---------- sources: each returns [(url, title)] ----------
     private fun bing(): List<Pair<String, String>> = listOf("en-US", "en-GB", "en-IN", "ja-JP", "de-DE").flatMap { m ->
-        val a = JSONObject(json("https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=$m")).getJSONArray("images")
+        val a = JSONObject(json("https://www.bing.com/HPImageArchive.aspx?format=js&idx=${Random.nextInt(8)}&n=8&mkt=$m")).getJSONArray("images")
         (0 until a.length()).map { a.getJSONObject(it) }.map { "https://www.bing.com" + it.getString("urlbase") + "_UHD.jpg" to it.optString("title", "Bing") }
     }
     private fun wiki(cat: String): List<Pair<String, String>> {
         val q = enc(term(cat) + " filetype:bitmap")
-        val r = JSONObject(json("https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=6&gsrlimit=30&gsroffset=${Random.nextInt(60)}&gsrsearch=$q&prop=imageinfo&iiprop=url%7Csize&iiurlwidth=2560"))
+        val r = JSONObject(json("https://commons.wikimedia.org/w/api.php?action=query&format=json&generator=search&gsrnamespace=6&gsrlimit=30&gsroffset=${Random.nextInt(300)}&gsrsearch=$q&prop=imageinfo&iiprop=url%7Csize&iiurlwidth=2560"))
         val pages = r.optJSONObject("query")?.optJSONObject("pages") ?: return emptyList()
         val out = ArrayList<Pair<String, String>>()
         for (k in pages.keys()) {
@@ -109,30 +124,30 @@ object Engine {
         return out
     }
     private fun nasa(): List<Pair<String, String>> {
-        val a = JSONArray(json("https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=10"))
+        val a = JSONArray(json("https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY&count=25"))
         return (0 until a.length()).map { a.getJSONObject(it) }.filter { it.optString("media_type") == "image" && it.has("hdurl") }
             .map { it.getString("hdurl") to it.optString("title", "NASA") }
     }
     private fun reddit(cat: String): List<Pair<String, String>> {
-        val a = JSONObject(json("https://www.reddit.com/r/${REDDIT[cat] ?: "wallpapers"}/top.json?t=week&limit=40")).getJSONObject("data").getJSONArray("children")
+        val a = JSONObject(json("https://www.reddit.com/r/${REDDIT[cat] ?: "wallpapers"}/top.json?t=${listOf("week", "month", "year", "all").random()}&limit=60")).getJSONObject("data").getJSONArray("children")
         return (0 until a.length()).map { a.getJSONObject(it).getJSONObject("data") }.filter {
             val u = it.optString("url").lowercase(); u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".png")
         }.map { it.getString("url") to "r/" + it.optString("subreddit") + " - " + it.optString("title").take(60) }
     }
     private fun unsplash(cat: String, key: String): List<Pair<String, String>> {
-        val a = JSONArray(json("https://api.unsplash.com/photos/random?query=${enc(term(cat).split(" ")[0])}&count=10&orientation=portrait&client_id=$key"))
+        val a = JSONArray(json("https://api.unsplash.com/photos/random?query=${enc(term(cat).split(" ")[0])}&count=30&orientation=portrait&client_id=$key"))
         return (0 until a.length()).map { a.getJSONObject(it) }.map {
             it.getJSONObject("urls").getString("raw") + "&w=2160&fit=max&fm=jpg" to "Unsplash - " + it.getJSONObject("user").getString("name")
         }
     }
     private fun pixabay(cat: String, key: String): List<Pair<String, String>> {
-        val a = JSONObject(json("https://pixabay.com/api/?key=$key&q=${enc(term(cat).split(" ")[0])}&orientation=vertical&image_type=photo&min_height=1920&per_page=30&page=${Random.nextInt(1, 3)}")).getJSONArray("hits")
+        val a = JSONObject(json("https://pixabay.com/api/?key=$key&q=${enc(term(cat).split(" ")[0])}&orientation=vertical&image_type=photo&min_height=1920&per_page=30&page=${Random.nextInt(1, 8)}")).getJSONArray("hits")
         return (0 until a.length()).map { a.getJSONObject(it) }.map {
             (it.optString("fullHDURL").ifBlank { it.optString("imageURL").ifBlank { it.getString("largeImageURL") } }) to "Pixabay - " + it.optString("user")
         }
     }
 
-    private suspend fun refill() {
+    private suspend fun gather(): List<Pair<String, String>> {
         val srcs = Cfg.list("src", "bing,wikimedia,nasa")
         val jobs = ArrayList<() -> List<Pair<String, String>>>()
         if ("bing" in srcs) jobs.add { bing() }
@@ -147,8 +162,20 @@ object Engine {
         val all = coroutineScope { jobs.map { j -> async(Dispatchers.IO) { runCatching { j() }.getOrDefault(emptyList()) } }.awaitAll() }.flatten()
         val blocked = Cfg.lines("block").toSet()
         val m = LinkedHashMap<String, String>(); all.forEach { m[it.first] = it.second }
-        var fresh = m.entries.filter { it.key !in blocked && it.key !in used }.map { it.key to it.value }
-        if (fresh.isEmpty()) { used.clear(); fresh = m.entries.filter { it.key !in blocked }.map { it.key to it.value } }
+        return m.entries.filter { it.key !in blocked }.map { it.key to it.value }
+    }
+
+    private suspend fun refill() {
+        var items = emptyList<Pair<String, String>>(); var fresh = items
+        for (i in 0 until 3) {                      // sources are randomised, so retrying usually finds new pictures
+            items = gather()
+            fresh = items.filter { nameOf(it.first) !in seen }
+            if (fresh.isNotEmpty()) break
+        }
+        if (fresh.isEmpty()) {                      // truly nothing new: only pictures not shown for 7+ days, oldest first
+            val week = System.currentTimeMillis() - 7 * 86_400_000L
+            fresh = items.sortedBy { seen[nameOf(it.first)] ?: 0L }.filter { (seen[nameOf(it.first)] ?: 0L) < week }.take(5)
+        }
         pool.clear(); pool.addAll(fresh.shuffled())
     }
 
@@ -178,8 +205,9 @@ object Engine {
         repeat(6) {
             if (pool.isEmpty()) refill()
             if (pool.isEmpty()) return null
-            val (u, t) = pool.removeAt(pool.size - 1); used.add(u)
-            val f = runCatching { download(c, u) }.getOrNull() ?: return@repeat
+            val (u, t) = pool.removeAt(pool.size - 1)
+            val f = runCatching { download(c, u) }.getOrNull()
+            if (f == null) { mark(c, nameOf(u)); return@repeat }     // rejected / failed: don't try it again
             meta(c).edit().putString(f.name, t).apply()
             return f to t
         }
@@ -187,8 +215,15 @@ object Engine {
     }
     private fun randomLocal(c: Context): Pair<File, String>? {
         val cur = Cfg.s("cur")
-        val all = (lib(c).listFiles().orEmpty() + fav(c).listFiles().orEmpty()).filter { it.name != cur }
-        val f = all.randomOrNull() ?: return null
+        val all = allFiles(c).filter { it.name != cur }
+        val sorted = all.distinctBy { it.name }.sortedBy { seen[it.name] ?: 0L }
+        val f = sorted.take(maxOf(1, sorted.size / 2)).randomOrNull() ?: return null
+        return f to titleOf(c, f.name)
+    }
+    /** Every now and then bring back a favorite (never twice within 24 hours). */
+    private fun pickFav(c: Context): Pair<File, String>? {
+        val cur = Cfg.s("cur"); val now = System.currentTimeMillis()
+        val f = fav(c).listFiles().orEmpty().filter { it.name != cur && now - (seen[it.name] ?: 0L) > 24 * 3_600_000L }.randomOrNull() ?: return null
         return f to titleOf(c, f.name)
     }
 
@@ -229,6 +264,7 @@ object Engine {
             else -> wm.setBitmap(bmp, null, true, home or lock)
         }
         bmp.recycle()
+        seenInit(c); mark(c, f.name)
         Cfg.set("cur", f.name); Cfg.set("curTitle", title)
         val keep = Cfg.i("libmax", 100)
         lib(c).listFiles().orEmpty().filter { it.name != f.name }.sortedByDescending { it.lastModified() }.drop(keep).forEach { it.delete() }
@@ -242,8 +278,9 @@ object Engine {
                 val bm = c.getSystemService(BatteryManager::class.java)
                 if (bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) < 20 && !bm.isCharging) return@withContext "Battery saver is on"
             }
+            seenInit(c)
             var got: Pair<File, String>? = null
-            if (online(c)) got = runCatching { fetchOne(c) }.getOrNull()
+            if (online(c)) got = (if (Random.nextFloat() < 0.2f) pickFav(c) else null) ?: runCatching { fetchOne(c) }.getOrNull()
             val offline = got == null
             if (got == null) got = randomLocal(c)
             val g = got ?: return@withContext "Nothing to show yet — connect to the internet once"
