@@ -8,12 +8,17 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import androidx.compose.runtime.mutableStateMapOf
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -27,6 +32,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
+import kotlin.math.pow
 import kotlin.random.Random
 
 /** Settings: a Compose-observable map that is mirrored to SharedPreferences. */
@@ -53,33 +59,45 @@ object Cfg {
 
 object Engine {
     const val UA = "WallpaperHub/1.0 (Android)"
+    const val DEF_CATS = "Flowers,Switzerland,France,Birds,City,Mountains"
+    val DEF_PRIO = setOf("Flowers", "Switzerland", "France", "Birds", "City")   // shown more often
+    const val DEF_SRC = "reddit,wikimedia,bing"
     val CATS = linkedMapOf(
-        "Nature" to "landscape nature scenery", "Space" to "nebula galaxy astronomy", "City" to "city skyline night",
-        "Animals" to "wildlife animal", "Ocean" to "ocean beach sea", "Mountains" to "mountain peak",
-        "Abstract" to "abstract pattern art", "Architecture" to "architecture building")
-    val ICONS = mapOf("Nature" to "🌿", "Space" to "🌌", "City" to "🌃", "Animals" to "🦁", "Ocean" to "🌊",
-        "Mountains" to "🏔️", "Abstract" to "🎨", "Architecture" to "🏛️")
+        "Flowers" to "flowers blossom garden", "Switzerland" to "switzerland alps village lake", "France" to "france paris eiffel provence village", "Birds" to "bird wildlife colorful",
+        "Ocean" to "ocean beach sea", "Mountains" to "mountain peak snow", "City" to "city skyline night lights",
+        "Sunset" to "sunset sky clouds", "Waterfall" to "waterfall river", "Forest" to "forest trees fog",
+        "Space" to "nebula galaxy astronomy", "Animals" to "wildlife animal", "Abstract" to "abstract pattern art")
+    val ICONS = mapOf("Flowers" to "🌸", "Switzerland" to "🇨🇭", "France" to "🇫🇷", "Birds" to "🦜", "Ocean" to "🌊", "Mountains" to "🏔️", "City" to "🌃",
+        "Sunset" to "🌅", "Waterfall" to "💧", "Forest" to "🌲", "Space" to "🌌", "Animals" to "🦁", "Abstract" to "🎨")
     val SOURCES = listOf("bing", "wikimedia", "nasa", "reddit", "unsplash", "pixabay")
-    private val REDDIT = mapOf("Nature" to "EarthPorn", "Space" to "spaceporn", "City" to "CityPorn", "Architecture" to "ArchitecturePorn")
+    private val REDDIT = mapOf("Flowers" to "flowers", "Switzerland" to "Switzerland", "France" to "CityPorn", "Birds" to "birding", "Ocean" to "oceanporn",
+        "Mountains" to "MountainPorn", "City" to "CityPorn", "Sunset" to "SkyPorn", "Waterfall" to "WaterfallPorn", "Forest" to "ForestPorn", "Space" to "spaceporn")
     private val pool = ArrayList<Pair<String, String>>()
+    private val catOf = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private fun tag(cat: String, l: List<Pair<String, String>>): List<Pair<String, String>> { l.forEach { catOf[it.first] = cat }; return l }
     // picture file name -> last time it was shown (persisted); a normal picture is not shown again for 120 days
     private val seen = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private var seenReady = false
     private fun nameOf(u: String) = md5(u) + ".jpg"
     private fun seenInit(c: Context) {
+        appCtx = c.applicationContext
         if (seenReady) return; seenReady = true
         val sp = c.getSharedPreferences("seen", 0); val ed = sp.edit(); val cut = System.currentTimeMillis() - 120 * 86_400_000L
         for ((k, v) in sp.all) { if (v is Long && v > cut) seen[k] = v else ed.remove(k) }
         ed.apply()
-        for (f in allFiles(c)) seen.putIfAbsent(f.name, f.lastModified())
+        for (f in fav(c).listFiles()?.toList() ?: emptyList<File>()) seen.putIfAbsent(f.name, f.lastModified())
     }
     private fun mark(c: Context, name: String) {
         val t = System.currentTimeMillis(); seen[name] = t
         c.getSharedPreferences("seen", 0).edit().putLong(name, t).apply()
     }
     private val mutex = Mutex()
+    private val poolLock = Mutex()
+    @Volatile private var dirty = false
+    @Volatile private var since = 0L
+    private var appCtx: Context? = null
 
-    fun reset() = pool.clear()
+    fun reset() { dirty = true; since = System.currentTimeMillis() }
     fun term(cat: String) = CATS[cat] ?: cat
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
     private fun md5(s: String) = MessageDigest.getInstance("MD5").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }
@@ -110,7 +128,7 @@ object Engine {
     // ---------- sources: each returns [(url, title)] ----------
     private fun bing(): List<Pair<String, String>> = listOf("en-US", "en-GB", "en-IN", "ja-JP", "de-DE").flatMap { m ->
         val a = JSONObject(json("https://www.bing.com/HPImageArchive.aspx?format=js&idx=${Random.nextInt(8)}&n=8&mkt=$m")).getJSONArray("images")
-        (0 until a.length()).map { a.getJSONObject(it) }.map { "https://www.bing.com" + it.getString("urlbase") + "_UHD.jpg" to it.optString("title", "Bing") }
+        (0 until a.length()).map { a.getJSONObject(it) }.map { "https://www.bing.com" + it.getString("urlbase") + "_1080x1920.jpg" to it.optString("title", "Bing") }
     }
     private fun wiki(cat: String): List<Pair<String, String>> {
         val q = enc(term(cat) + " filetype:bitmap")
@@ -119,7 +137,7 @@ object Engine {
         val out = ArrayList<Pair<String, String>>()
         for (k in pages.keys()) {
             val p = pages.getJSONObject(k); val ii = p.optJSONArray("imageinfo")?.optJSONObject(0) ?: continue
-            if (ii.optInt("width") >= 1920 && ii.has("thumburl")) out.add(ii.getString("thumburl") to p.getString("title").removePrefix("File:"))
+            if (dimsOk(ii.optInt("width"), ii.optInt("height")) && ii.has("thumburl")) out.add(ii.getString("thumburl") to p.getString("title").removePrefix("File:"))
         }
         return out
     }
@@ -128,11 +146,24 @@ object Engine {
         return (0 until a.length()).map { a.getJSONObject(it) }.filter { it.optString("media_type") == "image" && it.has("hdurl") }
             .map { it.getString("hdurl") to it.optString("title", "NASA") }
     }
+    private fun redditPosts(url: String): List<Pair<String, String>> {
+        val a = JSONObject(json(url)).getJSONObject("data").getJSONArray("children")
+        val out = ArrayList<Pair<String, String>>()
+        for (i in 0 until a.length()) {
+            val d = a.getJSONObject(i).getJSONObject("data")
+            val u = d.optString("url").lowercase()
+            if (!(u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".png"))) continue
+            val src = d.optJSONObject("preview")?.optJSONArray("images")?.optJSONObject(0)?.optJSONObject("source") ?: continue
+            if (!dimsOk(src.optInt("width"), src.optInt("height"))) continue
+            out.add(d.getString("url") to "r/" + d.optString("subreddit") + " - " + d.optString("title").take(60))
+        }
+        return out
+    }
     private fun reddit(cat: String): List<Pair<String, String>> {
-        val a = JSONObject(json("https://www.reddit.com/r/${REDDIT[cat] ?: "wallpapers"}/top.json?t=${listOf("week", "month", "year", "all").random()}&limit=60")).getJSONObject("data").getJSONArray("children")
-        return (0 until a.length()).map { a.getJSONObject(it).getJSONObject("data") }.filter {
-            val u = it.optString("url").lowercase(); u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".png")
-        }.map { it.getString("url") to "r/" + it.optString("subreddit") + " - " + it.optString("title").take(60) }
+        val t = listOf("month", "year", "all").random(); val q = enc(term(cat).split(" ")[0])
+        val phone = runCatching { redditPosts("https://www.reddit.com/r/phonewallpapers/search.json?q=$q&restrict_sr=1&sort=top&t=$t&limit=60") }.getOrDefault(emptyList())
+        val wide = runCatching { redditPosts("https://www.reddit.com/r/${REDDIT[cat] ?: "wallpapers"}/top.json?t=$t&limit=60") }.getOrDefault(emptyList())
+        return phone + wide
     }
     private fun unsplash(cat: String, key: String): List<Pair<String, String>> {
         val a = JSONArray(json("https://api.unsplash.com/photos/random?query=${enc(term(cat).split(" ")[0])}&count=30&orientation=portrait&client_id=$key"))
@@ -148,16 +179,16 @@ object Engine {
     }
 
     private suspend fun gather(): List<Pair<String, String>> {
-        val srcs = Cfg.list("src", "bing,wikimedia,nasa")
+        val srcs = Cfg.list("src", DEF_SRC)
         val jobs = ArrayList<() -> List<Pair<String, String>>>()
         if ("bing" in srcs) jobs.add { bing() }
         if ("nasa" in srcs) jobs.add { nasa() }
         val uk = Cfg.s("unsplash_key"); val pk = Cfg.s("pixabay_key")
-        for (c in Cfg.list("cats", "Nature,Space")) {
-            if ("wikimedia" in srcs) jobs.add { wiki(c) }
-            if ("reddit" in srcs) jobs.add { reddit(c) }
-            if ("unsplash" in srcs && uk.isNotBlank()) jobs.add { unsplash(c, uk) }
-            if ("pixabay" in srcs && pk.isNotBlank()) jobs.add { pixabay(c, pk) }
+        for (c in Cfg.list("cats", DEF_CATS)) {
+            if ("wikimedia" in srcs) jobs.add { tag(c, wiki(c)) }
+            if ("reddit" in srcs) jobs.add { tag(c, reddit(c)) }
+            if ("unsplash" in srcs && uk.isNotBlank()) jobs.add { tag(c, unsplash(c, uk)) }
+            if ("pixabay" in srcs && pk.isNotBlank()) jobs.add { tag(c, pixabay(c, pk)) }
         }
         val all = coroutineScope { jobs.map { j -> async(Dispatchers.IO) { runCatching { j() }.getOrDefault(emptyList()) } }.awaitAll() }.flatten()
         val blocked = Cfg.lines("block").toSet()
@@ -176,16 +207,30 @@ object Engine {
             val week = System.currentTimeMillis() - 7 * 86_400_000L
             fresh = items.sortedBy { seen[nameOf(it.first)] ?: 0L }.filter { (seen[nameOf(it.first)] ?: 0L) < week }.take(5)
         }
-        pool.clear(); pool.addAll(fresh.shuffled())
+        fun w(u: String) = if ((catOf[u] ?: "") in DEF_PRIO) 3.0 else 1.0
+        pool.clear(); pool.addAll(fresh.sortedBy { Random.nextDouble().pow(1.0 / w(it.first)) })   // pool pops from the end: priority categories tend to come first
     }
 
-    // ---------- download + quality filter ----------
-    private fun good(c: Context, w: Int, h: Int): Boolean {
-        val d = c.resources.displayMetrics
-        val sl = maxOf(d.widthPixels, d.heightPixels); val ss = minOf(d.widthPixels, d.heightPixels)
-        val ar = w.toFloat() / h
-        if (ar < 0.4f || ar > 2.6f) return false
-        return if (Cfg.b("strict", true)) maxOf(w, h) >= sl * 0.9 && minOf(w, h) >= ss * 0.9 else maxOf(w, h) >= 1280
+    // ---------- screen, shape check, download ----------
+    @Suppress("DEPRECATION")
+    fun screen(c: Context): IntArray {
+        val dm = DisplayMetrics()
+        (c.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+        return intArrayOf(minOf(dm.widthPixels, dm.heightPixels), maxOf(dm.widthPixels, dm.heightPixels))
+    }
+    /** Size the picture would have after cropping to a tall phone shape, or null if it is not good enough. */
+    private fun fit(c: Context, w: Int, h: Int): IntArray? {
+        val sc = screen(c); val t = sc[0].toFloat() / sc[1]; val ar = w.toFloat() / h
+        var cw = w; var ch = h
+        if (ar > t * 1.45f) { if (!Cfg.b("crop", true)) return null; cw = (h * t).toInt() }
+        else if (ar < t * 0.8f) ch = (w / t).toInt()
+        val k = if (Cfg.b("strict", true)) 0.9f else 0.7f
+        return if (cw >= sc[0] * k && ch >= sc[1] * k) intArrayOf(cw, ch) else null
+    }
+    private fun dimsOk(w: Int, h: Int): Boolean {
+        val c = appCtx ?: return true
+        if (w <= 0 || h <= 0) return true
+        return fit(c, w, h) != null
     }
     private fun download(c: Context, url: String): File? {
         val f = File(lib(c), md5(url) + ".jpg")
@@ -193,15 +238,27 @@ object Engine {
         val bytes = get(url)
         val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
-        if (o.outWidth <= 0 || !good(c, o.outWidth, o.outHeight)) return null
-        var s = 1; while (maxOf(o.outWidth, o.outHeight) / s > 3000) s *= 2
-        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = s }) ?: return null
-        f.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
-        bmp.recycle()
+        val plan = (if (o.outWidth > 0) fit(c, o.outWidth, o.outHeight) else null) ?: return null
+        val sc = screen(c); val t = sc[0].toFloat() / sc[1]
+        var s = 1
+        while (plan[1] / (s * 2) >= sc[1] * 1.25 && plan[0] / (s * 2) >= sc[0] * 1.25) s *= 2
+        val full = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = s }) ?: return null
+        val ar = full.width.toFloat() / full.height
+        val bmp = when {
+            ar > t * 1.45f -> { val nw = (full.height * t).toInt().coerceIn(1, full.width); Bitmap.createBitmap(full, (full.width - nw) / 2, 0, nw, full.height) }
+            ar < t * 0.8f -> { val nh = (full.width / t).toInt().coerceIn(1, full.height); Bitmap.createBitmap(full, 0, (full.height - nh) / 2, full.width, nh) }
+            else -> full
+        }
+        f.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        if (bmp !== full) bmp.recycle()
+        full.recycle()
         meta(c).edit().putString(f.name + ".u", url).apply()
         return f
     }
-    private suspend fun fetchOne(c: Context): Pair<File, String>? {
+    private suspend fun fetchOne(c: Context): Pair<File, String>? = poolLock.withLock { fetchLocked(c) }
+
+    private suspend fun fetchLocked(c: Context): Pair<File, String>? {
+        if (dirty) { dirty = false; pool.clear() }
         repeat(6) {
             if (pool.isEmpty()) refill()
             if (pool.isEmpty()) return null
@@ -220,6 +277,21 @@ object Engine {
         val f = sorted.take(maxOf(1, sorted.size / 2)).randomOrNull() ?: return null
         return f to titleOf(c, f.name)
     }
+    private fun readyFiles(c: Context): List<File> {
+        val cur = Cfg.s("cur")
+        return lib(c).listFiles()?.filter { it.name != cur && !seen.containsKey(it.name) && it.lastModified() >= since } ?: emptyList()
+    }
+    private val filling = java.util.concurrent.atomic.AtomicBoolean(false)
+    /** Keep a few unseen pictures downloaded so the next change is instant (and works offline). */
+    fun topUp(c: Context) {
+        if (!filling.compareAndSet(false, true)) return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                var n = 0
+                while (online(c) && n < 8 && readyFiles(c).size < 8 && libCount(c) < Cfg.i("libmax", 100)) { runCatching { fetchOne(c) }; n++ }
+            } finally { filling.set(false) }
+        }
+    }
     /** Every now and then bring back a favorite (never twice within 24 hours). */
     private fun pickFav(c: Context): Pair<File, String>? {
         val cur = Cfg.s("cur"); val now = System.currentTimeMillis()
@@ -235,19 +307,27 @@ object Engine {
         return mut(Bitmap.createScaledBitmap(small, b.width, b.height, true))
     }
     private fun render(c: Context, f: File): Bitmap {
-        val d = c.resources.displayMetrics; val sw = d.widthPixels; val sh = d.heightPixels
+        val sc = screen(c); val sw = sc[0]; val sh = sc[1]
         val src = BitmapFactory.decodeFile(f.path)
         var out = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-        fun draw(cv: Canvas, fill: Boolean) {
-            val a = sw.toFloat() / src.width; val b = sh.toFloat() / src.height
-            val s = if (fill) maxOf(a, b) else minOf(a, b); val w = src.width * s; val h = src.height * s
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        fun draw(cv: Canvas, s: Float) {
+            val w = src.width * s; val h = src.height * s
             cv.drawBitmap(src, null, RectF((sw - w) / 2, (sh - h) / 2, (sw + w) / 2, (sh + h) / 2), paint)
         }
-        when (Cfg.s("fit", "blur")) {
-            "fill" -> draw(Canvas(out), true)
-            "black" -> { val cv = Canvas(out); cv.drawColor(Color.BLACK); draw(cv, false) }
-            else -> { draw(Canvas(out), true); out = blur(out, 12); val cv = Canvas(out); cv.drawColor(0x88000000.toInt()); draw(cv, false) }
+        val fillS = maxOf(sw.toFloat() / src.width, sh.toFloat() / src.height)
+        val fitS = minOf(sw.toFloat() / src.width, sh.toFloat() / src.height)
+        var mode = Cfg.s("fit", "auto")
+        if (mode == "auto") {   // close to the screen shape -> fill, otherwise whole picture with soft bars
+            val t = sw.toFloat() / sh; val ar = src.width.toFloat() / src.height
+            mode = if (ar >= t * 0.75f && ar <= t * 1.35f) "fill" else "blur"
+        }
+        when (mode) {
+            "fill" -> draw(Canvas(out), fillS)
+            "stretch" -> Canvas(out).drawBitmap(src, null, RectF(0f, 0f, sw.toFloat(), sh.toFloat()), paint)
+            "center" -> { val cv = Canvas(out); cv.drawColor(Color.BLACK); draw(cv, 1f) }
+            "black" -> { val cv = Canvas(out); cv.drawColor(Color.BLACK); draw(cv, fitS) }
+            else -> { draw(Canvas(out), fillS); out = blur(out, 12); val cv = Canvas(out); cv.drawColor(0x88000000.toInt()); draw(cv, fitS) }
         }
         src.recycle()
         if (Cfg.b("blur", false)) out = blur(out, Cfg.i("blur_amt", 8))
@@ -257,11 +337,14 @@ object Engine {
     }
     fun apply(c: Context, f: File, title: String) {
         val bmp = render(c, f); val wm = WallpaperManager.getInstance(c)
+        val sc = screen(c)
+        runCatching { wm.suggestDesiredDimensions(sc[0], sc[1]) }       // screen-sized, no sideways scrolling / zoom
+        val hint = Rect(0, 0, bmp.width, bmp.height)
         val home = WallpaperManager.FLAG_SYSTEM; val lock = WallpaperManager.FLAG_LOCK
         when (Cfg.s("target", "both")) {
-            "home" -> wm.setBitmap(bmp, null, true, home)
-            "lock" -> wm.setBitmap(bmp, null, true, lock)
-            else -> wm.setBitmap(bmp, null, true, home or lock)
+            "home" -> wm.setBitmap(bmp, hint, true, home)
+            "lock" -> wm.setBitmap(bmp, hint, true, lock)
+            else -> wm.setBitmap(bmp, hint, true, home or lock)
         }
         bmp.recycle()
         seenInit(c); mark(c, f.name)
@@ -279,13 +362,14 @@ object Engine {
                 if (bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) < 20 && !bm.isCharging) return@withContext "Battery saver is on"
             }
             seenInit(c)
-            var got: Pair<File, String>? = null
-            if (online(c)) got = (if (Random.nextFloat() < 0.2f) pickFav(c) else null) ?: runCatching { fetchOne(c) }.getOrNull()
+            var got: Pair<File, String>? = (if (Random.nextFloat() < 0.2f) pickFav(c) else null)
+                ?: readyFiles(c).randomOrNull()?.let { it to titleOf(c, it.name) }       // already downloaded -> instant
+            if (got == null && online(c)) got = runCatching { fetchOne(c) }.getOrNull()
             val offline = got == null
             if (got == null) got = randomLocal(c)
             val g = got ?: return@withContext "Nothing to show yet — connect to the internet once"
             apply(c, g.first, g.second)
-            if (!offline && libCount(c) < Cfg.i("libmax", 100) / 2) repeat(2) { runCatching { fetchOne(c) } }   // grow the offline library
+            topUp(c)
             if (offline) "Offline — picked from your Library" else "New picture applied"
         }
     }
